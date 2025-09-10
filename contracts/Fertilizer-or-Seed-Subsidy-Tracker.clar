@@ -20,7 +20,7 @@
         amount: uint,
         distributor: principal,
         distributed-at: uint,
-        block-height: uint
+        height: uint
     }
 )
 
@@ -113,7 +113,7 @@
                 amount: amount,
                 distributor: tx-sender,
                 distributed-at: stacks-block-height,
-                block-height: stacks-block-height
+                height: stacks-block-height
             }
         )
         
@@ -168,7 +168,7 @@
             verified: true,
             amount: (get amount record),
             distributor: (get distributor record),
-            block-height: (get block-height record)
+            block-height: (get height record)
         })
         none
     )
@@ -304,5 +304,114 @@
             threshold-value: avg-amount
         })
         (map-delete region-alerts region)
+    )
+)
+
+(define-map audit-trail
+    uint
+    {
+        transaction-hash: (buff 32),
+        beneficiary: principal,
+        amount: uint,
+        timestamp: uint,
+        previous-hash: (buff 32),
+        verification-status: (string-ascii 10)
+    }
+)
+
+(define-map suspicious-activities
+    uint
+    {
+        activity-type: (string-ascii 30),
+        flagged-at: uint,
+        risk-score: uint,
+        auto-generated: bool
+    }
+)
+
+(define-data-var audit-counter uint u0)
+(define-data-var last-audit-hash (buff 32) 0x00000000000000000000000000000000)
+
+(define-read-only (generate-transaction-hash (beneficiary principal) (amount uint) (height uint))
+    (keccak256 (concat 
+        (concat (unwrap-panic (to-consensus-buff? beneficiary)) (unwrap-panic (to-consensus-buff? amount)))
+        (unwrap-panic (to-consensus-buff? height))
+    ))
+)
+
+(define-private (create-audit-record (beneficiary principal) (amount uint))
+    (let ((counter (+ (var-get audit-counter) u1))
+          (tx-hash (generate-transaction-hash beneficiary amount stacks-block-height))
+          (prev-hash (var-get last-audit-hash)))
+        (map-set audit-trail counter {
+            transaction-hash: tx-hash,
+            beneficiary: beneficiary,
+            amount: amount,
+            timestamp: stacks-block-height,
+            previous-hash: prev-hash,
+            verification-status: "verified"
+        })
+        (var-set audit-counter counter)
+        (var-set last-audit-hash tx-hash)
+        (detect-suspicious-patterns beneficiary amount)
+    )
+)
+
+(define-private (detect-suspicious-patterns (beneficiary principal) (amount uint))
+    (let ((history (get-beneficiary-history beneficiary))
+          (total-received (get total-received history))
+          (risk-score (if (> amount u1000) u8 (if (> total-received u5000) u6 u2))))
+        (if (>= risk-score u6)
+            (map-set suspicious-activities (+ (var-get audit-counter) u1) {
+                activity-type: "high-value-distribution",
+                flagged-at: stacks-block-height,
+                risk-score: risk-score,
+                auto-generated: true
+            })
+            true
+        )
+    )
+)
+
+(define-read-only (verify-audit-chain (start-id uint) (end-id uint))
+    (fold verify-single-audit (list start-id (+ start-id u1) (+ start-id u2)) true)
+)
+
+(define-private (verify-single-audit (audit-id uint) (is-valid bool))
+    (if (not is-valid)
+        false
+        (match (map-get? audit-trail audit-id)
+            record (let ((expected-hash (generate-transaction-hash 
+                           (get beneficiary record)
+                           (get amount record)
+                           (get timestamp record))))
+                       (is-eq (get transaction-hash record) expected-hash))
+            false
+        )
+    )
+)
+
+(define-read-only (get-audit-record (audit-id uint))
+    (map-get? audit-trail audit-id)
+)
+
+(define-read-only (get-suspicious-activities (limit uint))
+    (map get-activity-by-id (list u1 u2 u3 u4 u5))
+)
+
+(define-private (get-activity-by-id (id uint))
+    (map-get? suspicious-activities id)
+)
+
+(define-read-only (validate-distribution-integrity (beneficiary principal) (claimed-total uint))
+    (let ((actual-history (get-beneficiary-history beneficiary))
+          (actual-total (get total-received actual-history)))
+        {
+            is-valid: (is-eq claimed-total actual-total),
+            variance: (if (> claimed-total actual-total) 
+                        (- claimed-total actual-total)
+                        (- actual-total claimed-total)),
+            confidence-level: (if (is-eq claimed-total actual-total) u100 u0)
+        }
     )
 )
