@@ -5,6 +5,10 @@
 (define-constant ERR_INVALID_AMOUNT (err u103))
 (define-constant ERR_DISTRIBUTOR_NOT_AUTHORIZED (err u104))
 
+(define-constant ERR_VOUCHER_NOT_FOUND (err u105))
+(define-constant ERR_VOUCHER_EXPIRED (err u106))
+(define-constant ERR_VOUCHER_ALREADY_REDEEMED (err u107))
+
 (define-data-var contract-owner principal CONTRACT_OWNER)
 
 (define-map authorized-distributors principal bool)
@@ -413,5 +417,85 @@
                         (- actual-total claimed-total)),
             confidence-level: (if (is-eq claimed-total actual-total) u100 u0)
         }
+    )
+)
+
+(define-map subsidy-vouchers
+    {voucher-id: uint}
+    {
+        beneficiary: principal,
+        subsidy-type: (string-ascii 20),
+        amount: uint,
+        season: uint,
+        issued-at: uint,
+        expires-at: uint,
+        redeemed: bool,
+        issued-by: principal
+    }
+)
+
+(define-data-var voucher-counter uint u0)
+
+(define-public (issue-voucher
+    (beneficiary principal)
+    (subsidy-type (string-ascii 20))
+    (amount uint)
+    (season uint)
+    (expiry-blocks uint)
+)
+    (begin
+        (asserts! (is-authorized-distributor tx-sender) ERR_DISTRIBUTOR_NOT_AUTHORIZED)
+        (asserts! (> amount u0) ERR_INVALID_AMOUNT)
+        (asserts! (is-some (get-beneficiary beneficiary)) ERR_BENEFICIARY_NOT_FOUND)
+        (let ((voucher-id (+ (var-get voucher-counter) u1))
+              (current-height stacks-block-height))
+            (map-set subsidy-vouchers {voucher-id: voucher-id} {
+                beneficiary: beneficiary,
+                subsidy-type: subsidy-type,
+                amount: amount,
+                season: season,
+                issued-at: current-height,
+                expires-at: (+ current-height expiry-blocks),
+                redeemed: false,
+                issued-by: tx-sender
+            })
+            (var-set voucher-counter voucher-id)
+            (ok voucher-id)
+        )
+    )
+)
+
+(define-public (redeem-voucher (voucher-id uint))
+    (let ((voucher-opt (map-get? subsidy-vouchers {voucher-id: voucher-id})))
+        (match voucher-opt
+            voucher (begin
+                (asserts! (is-eq tx-sender (get beneficiary voucher)) ERR_UNAUTHORIZED)
+                (asserts! (not (get redeemed voucher)) ERR_VOUCHER_ALREADY_REDEEMED)
+                (asserts! (<= stacks-block-height (get expires-at voucher)) ERR_VOUCHER_EXPIRED)
+                (map-set subsidy-vouchers {voucher-id: voucher-id}
+                    (merge voucher {redeemed: true}))
+                (distribute-subsidy
+                    (get beneficiary voucher)
+                    (get subsidy-type voucher)
+                    (get amount voucher)
+                    (get season voucher)
+                )
+            )
+            ERR_VOUCHER_NOT_FOUND
+        )
+    )
+)
+
+(define-read-only (get-voucher (voucher-id uint))
+    (map-get? subsidy-vouchers {voucher-id: voucher-id})
+)
+
+(define-read-only (is-voucher-valid (voucher-id uint))
+    (match (get-voucher voucher-id)
+        voucher (and
+            (not (get redeemed voucher))
+            (<= stacks-block-height (get expires-at voucher))
+        )
+        false
     )
 )
