@@ -9,6 +9,10 @@
 (define-constant ERR_VOUCHER_EXPIRED (err u106))
 (define-constant ERR_VOUCHER_ALREADY_REDEEMED (err u107))
 
+(define-data-var multisig-threshold uint u3)
+(define-data-var high-value-threshold uint u1000)
+(define-data-var proposal-counter uint u0)
+
 (define-data-var contract-owner principal CONTRACT_OWNER)
 
 (define-map authorized-distributors principal bool)
@@ -498,4 +502,101 @@
         )
         false
     )
+)
+
+(define-map multisig-proposals
+    {proposal-id: uint}
+    {
+        beneficiary: principal,
+        subsidy-type: (string-ascii 20),
+        amount: uint,
+        season: uint,
+        proposer: principal,
+        approvals: uint,
+        executed: bool,
+        created-at: uint
+    }
+)
+
+(define-map proposal-approvers
+    {proposal-id: uint, approver: principal}
+    bool
+)
+
+(define-constant ERR_PROPOSAL_NOT_FOUND (err u108))
+(define-constant ERR_ALREADY_APPROVED (err u109))
+(define-constant ERR_INSUFFICIENT_APPROVALS (err u110))
+(define-constant ERR_ALREADY_EXECUTED (err u111))
+
+(define-public (propose-high-value-distribution
+    (beneficiary principal)
+    (subsidy-type (string-ascii 20))
+    (amount uint)
+    (season uint)
+)
+    (begin
+        (asserts! (is-authorized-distributor tx-sender) ERR_DISTRIBUTOR_NOT_AUTHORIZED)
+        (asserts! (> amount (var-get high-value-threshold)) ERR_INVALID_AMOUNT)
+        (asserts! (is-some (get-beneficiary beneficiary)) ERR_BENEFICIARY_NOT_FOUND)
+        (let ((proposal-id (+ (var-get proposal-counter) u1)))
+            (map-set multisig-proposals {proposal-id: proposal-id} {
+                beneficiary: beneficiary,
+                subsidy-type: subsidy-type,
+                amount: amount,
+                season: season,
+                proposer: tx-sender,
+                approvals: u1,
+                executed: false,
+                created-at: stacks-block-height
+            })
+            (map-set proposal-approvers {proposal-id: proposal-id, approver: tx-sender} true)
+            (var-set proposal-counter proposal-id)
+            (ok proposal-id)
+        )
+    )
+)
+
+(define-public (approve-proposal (proposal-id uint))
+    (let ((proposal-opt (map-get? multisig-proposals {proposal-id: proposal-id})))
+        (match proposal-opt
+            proposal (begin
+                (asserts! (is-authorized-distributor tx-sender) ERR_DISTRIBUTOR_NOT_AUTHORIZED)
+                (asserts! (not (get executed proposal)) ERR_ALREADY_EXECUTED)
+                (asserts! (is-none (map-get? proposal-approvers {proposal-id: proposal-id, approver: tx-sender})) ERR_ALREADY_APPROVED)
+                (map-set proposal-approvers {proposal-id: proposal-id, approver: tx-sender} true)
+                (map-set multisig-proposals {proposal-id: proposal-id}
+                    (merge proposal {approvals: (+ (get approvals proposal) u1)}))
+                (ok true)
+            )
+            ERR_PROPOSAL_NOT_FOUND
+        )
+    )
+)
+
+(define-public (execute-proposal (proposal-id uint))
+    (let ((proposal-opt (map-get? multisig-proposals {proposal-id: proposal-id})))
+        (match proposal-opt
+            proposal (begin
+                (asserts! (>= (get approvals proposal) (var-get multisig-threshold)) ERR_INSUFFICIENT_APPROVALS)
+                (asserts! (not (get executed proposal)) ERR_ALREADY_EXECUTED)
+                (map-set multisig-proposals {proposal-id: proposal-id}
+                    (merge proposal {executed: true}))
+                (distribute-subsidy
+                    (get beneficiary proposal)
+                    (get subsidy-type proposal)
+                    (get amount proposal)
+                    (get season proposal)
+                )
+            )
+            ERR_PROPOSAL_NOT_FOUND
+        )
+    )
+)
+
+(define-read-only (get-proposal (proposal-id uint))
+    (map-get? multisig-proposals {proposal-id: proposal-id})
+)
+
+(define-read-only (has-approved (proposal-id uint) (approver principal))
+    (default-to false (map-get? proposal-approvers {proposal-id: proposal-id, approver: approver}))
 )
